@@ -396,8 +396,22 @@ def line_chart(daily_df: pd.DataFrame) -> alt.Chart:
         alt.Chart(daily_df)
         .mark_line(point=True, interpolate="monotone", strokeWidth=3)
         .encode(
-            x=alt.X("date:T", title=None),
-            y=alt.Y("views:Q", title="Views"),
+            x=alt.X(
+                "date:T",
+                title=None,
+                axis=alt.Axis(
+                    format="%b %d",
+                    labelAngle=0,
+                    labelOverlap="greedy",
+                    tickCount=12,
+                    grid=False,
+                ),
+            ),
+            y=alt.Y(
+                "views:Q",
+                title="Views",
+                axis=alt.Axis(format="~s", grid=True),
+            ),
             color=alt.Color(
                 "content_type:N",
                 title="Content type",
@@ -418,7 +432,7 @@ def line_chart(daily_df: pd.DataFrame) -> alt.Chart:
                 ),
             ],
         )
-        .properties(height=460)
+        .properties(height=440)
     )
 
 
@@ -491,66 +505,76 @@ def main() -> None:
     st.subheader("Views Over Time")
     st.altair_chart(line_chart(daily_df), use_container_width=True)
 
-    left, right = st.columns([0.58, 0.42])
-    with left:
-        st.subheader("Content Type Summary")
-        summary = kpis.copy()
-        summary["Avg view duration"] = summary["avg_view_duration_seconds"].map(format_seconds)
-        summary = summary[
-            [
-                "content_type",
-                "views",
-                "videos",
-                "avg_views",
-                "watch_hours",
-                "Avg view duration",
-            ]
-        ].rename(
-            columns={
-                "content_type": "Content type",
-                "views": "Views",
-                "videos": "Videos",
-                "avg_views": "Avg views",
-                "watch_hours": "Watch hours",
-            }
-        )
-        st.dataframe(
-            summary,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Views": st.column_config.NumberColumn(format="%d"),
-                "Videos": st.column_config.NumberColumn(format="%d"),
-                "Avg views": st.column_config.NumberColumn(format="%.0f"),
-                "Watch hours": st.column_config.NumberColumn(format="%.1f"),
-            },
-        )
+    st.subheader("Content Type Summary")
+    summary = kpis.copy()
+    summary["Avg view duration"] = summary["avg_view_duration_seconds"].map(format_seconds)
+    summary = summary[
+        [
+            "content_type",
+            "views",
+            "avg_views",
+            "videos",
+            "watch_hours",
+            "Avg view duration",
+        ]
+    ].rename(
+        columns={
+            "content_type": "Content type",
+            "views": "Views",
+            "avg_views": "Avg views",
+            "videos": "Videos",
+            "watch_hours": "Watch hours",
+        }
+    )
+    st.dataframe(
+        summary,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Content type": st.column_config.TextColumn(width="medium"),
+            "Views": st.column_config.NumberColumn(format="%d", width="small"),
+            "Avg views": st.column_config.NumberColumn(format="%.0f", width="small"),
+            "Videos": st.column_config.NumberColumn(format="%d", width="small"),
+            "Watch hours": st.column_config.NumberColumn(format="%.1f", width="small"),
+            "Avg view duration": st.column_config.TextColumn(width="small"),
+        },
+    )
 
-    with right:
-        st.subheader("Top Videos")
-        top_videos = (
-            detail_df.groupby(["video_id", "title", "content_type"], as_index=False)
-            .agg(views=("views", "sum"), watch_minutes=("watch_minutes", "sum"))
-            .sort_values("views", ascending=False)
-            .head(15)
-            .rename(
-                columns={
-                    "title": "Title",
-                    "content_type": "Content type",
-                    "views": "Views",
-                    "watch_minutes": "Watch minutes",
-                }
-            )
+    st.subheader("Top Videos")
+    top_videos = (
+        detail_df.groupby(["video_id", "title", "content_type"], as_index=False)
+        .agg(
+            views=("views", "sum"),
+            watch_minutes=("watch_minutes", "sum"),
+            avg_view_duration_seconds=("avg_view_duration_seconds", "mean"),
         )
-        st.dataframe(
-            top_videos[["Title", "Content type", "Views", "Watch minutes"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Views": st.column_config.NumberColumn(format="%d"),
-                "Watch minutes": st.column_config.NumberColumn(format="%.0f"),
-            },
-        )
+        .sort_values("views", ascending=False)
+        .head(15)
+    )
+    top_videos["Rank"] = range(1, len(top_videos) + 1)
+    top_videos["Watch hours"] = top_videos["watch_minutes"] / 60
+    top_videos["Avg duration"] = top_videos["avg_view_duration_seconds"].map(format_seconds)
+    top_videos = top_videos.rename(
+        columns={
+            "title": "Title",
+            "content_type": "Type",
+            "views": "Views",
+        }
+    )
+    st.dataframe(
+        top_videos[["Rank", "Title", "Views", "Type", "Watch hours", "Avg duration"]],
+        use_container_width=True,
+        hide_index=True,
+        height=560,
+        column_config={
+            "Rank": st.column_config.NumberColumn(format="%d", width="small"),
+            "Title": st.column_config.TextColumn(width="large"),
+            "Views": st.column_config.NumberColumn(format="%d", width="small"),
+            "Type": st.column_config.TextColumn(width="small"),
+            "Watch hours": st.column_config.NumberColumn(format="%.1f", width="small"),
+            "Avg duration": st.column_config.TextColumn(width="small"),
+        },
+    )
 
 
 if __name__ == "__main__":
