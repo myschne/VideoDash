@@ -2,16 +2,25 @@ from __future__ import annotations
 
 import json
 import re
+import base64
+import binascii
+import hashlib
+import hmac
+import secrets
+import time
 from datetime import date, timedelta
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
 
 
 SCOPES = [
@@ -29,27 +38,217 @@ CONTENT_COLORS = {
 }
 
 
-def youtube_secrets() -> dict[str, Any]:
-    if "youtube" not in st.secrets:
+def secret(name: str, default: Any = None) -> Any:
+    try:
+        return st.secrets.get(name, default)
+    except FileNotFoundError:
+        return default
+
+
+def toml_table(name: str, values: dict[str, Any]) -> str:
+    lines = [f"[{name}]"]
+    for key, value in values.items():
+        if value is None:
+            continue
+        encoded = str(value).lower() if isinstance(value, bool) else json.dumps(value)
+        lines.append(f"{key} = {encoded}")
+    return "\n".join(lines)
+
+
+def youtube_token_secrets() -> dict[str, Any]:
+    token = secret("youtube_oauth_token")
+    if token:
+        return dict(token)
+
+    legacy = secret("youtube")
+    if legacy:
+        return dict(legacy)
+
+    raise RuntimeError(
+        "Missing YouTube token in Streamlit Secrets. Add a [youtube_oauth_token] "
+        "section, or use Reconnect YouTube to generate one."
+    )
+
+
+def youtube_settings() -> dict[str, Any]:
+    settings = secret("youtube")
+    if not settings:
         raise RuntimeError(
-            "Missing Streamlit secrets section [youtube]. Add client_id, "
-            "client_secret, refresh_token, and podcast_playlist_id."
+            "Missing Streamlit secrets section [youtube]. Add podcast_playlist_id."
         )
-    return dict(st.secrets["youtube"])
+    return dict(settings)
 
 
 def make_credentials() -> Credentials:
-    secrets = youtube_secrets()
+    token = youtube_token_secrets()
     credentials = Credentials(
-        token=None,
-        refresh_token=secrets["refresh_token"],
-        token_uri=secrets.get("token_uri", "https://oauth2.googleapis.com/token"),
-        client_id=secrets["client_id"],
-        client_secret=secrets["client_secret"],
-        scopes=SCOPES,
+        token=token.get("token"),
+        refresh_token=token.get("refresh_token"),
+        token_uri=token.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=token["client_id"],
+        client_secret=token["client_secret"],
+        scopes=token.get("scopes", SCOPES),
     )
-    credentials.refresh(GoogleAuthRequest())
+    try:
+        credentials.refresh(GoogleAuthRequest())
+    except RefreshError as error:
+        raise RuntimeError(
+            "YouTube authorization expired or was revoked. Open Reconnect YouTube "
+            "from the left menu, sign in with the YouTube channel owner or manager "
+            "account, then replace the [youtube_oauth_token] block in Streamlit Secrets."
+        ) from error
     return credentials
+
+
+def youtube_web_oauth_settings() -> tuple[dict[str, Any], str]:
+    client = secret("youtube_web_oauth_client")
+    redirect_uri = str(secret("youtube_redirect_uri", "")).strip()
+    if client and redirect_uri:
+        return dict(client), redirect_uri
+
+    legacy = secret("youtube")
+    if legacy and not redirect_uri:
+        redirect_uri = str(legacy.get("youtube_redirect_uri") or legacy.get("redirect_uri") or "").strip()
+    if legacy and legacy.get("client_id") and legacy.get("client_secret") and redirect_uri:
+        return {
+            "client_id": legacy["client_id"],
+            "client_secret": legacy["client_secret"],
+            "auth_uri": legacy.get("auth_uri", "https://accounts.google.com/o/oauth2/auth"),
+            "token_uri": legacy.get("token_uri", "https://oauth2.googleapis.com/token"),
+        }, redirect_uri
+
+    raise RuntimeError(
+        "Reconnect YouTube is not set up yet. Add youtube_redirect_uri and "
+        "[youtube_web_oauth_client] to Streamlit Secrets."
+    )
+
+
+def youtube_oauth_state(client_secret: str, code_verifier: str) -> str:
+    payload = json.dumps(
+        {
+            "created_at": int(time.time()),
+            "nonce": secrets.token_urlsafe(24),
+            "code_verifier": code_verifier,
+        },
+        separators=(",", ":"),
+    )
+    encoded = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    signature = hmac.new(client_secret.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def youtube_oauth_code_verifier(state: str, client_secret: str) -> str | None:
+    try:
+        encoded, signature = state.rsplit(".", 1)
+        expected = hmac.new(client_secret.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        padding = "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded + padding).decode())
+        created_at = int(payload["created_at"])
+        code_verifier = str(payload["code_verifier"])
+        if not 0 <= time.time() - created_at <= 900:
+            return None
+        if not 43 <= len(code_verifier) <= 128:
+            return None
+        return code_verifier
+    except (binascii.Error, KeyError, ValueError, TypeError, UnicodeDecodeError):
+        return None
+
+
+def render_youtube_reconnect_page() -> None:
+    st.title("Reconnect YouTube")
+    st.write(
+        "Use this page when the dashboard says YouTube authorization expired or was revoked."
+    )
+    st.warning(
+        "Streamlit cannot update saved Secrets by itself. This page creates a "
+        "replacement token block that an administrator must copy into Streamlit Secrets."
+    )
+
+    try:
+        client, redirect_uri = youtube_web_oauth_settings()
+    except RuntimeError as error:
+        st.error(str(error))
+        st.info("See the README section about reconnecting YouTube for the one-time setup.")
+        return
+
+    code = st.query_params.get("code")
+    returned_state = st.query_params.get("state")
+    oauth_error = st.query_params.get("error")
+    if oauth_error:
+        st.error(f"Google did not authorize YouTube: {oauth_error}")
+        st.query_params.clear()
+        return
+
+    if code:
+        client_secret = str(client.get("client_secret", ""))
+        code_verifier = (
+            youtube_oauth_code_verifier(returned_state, client_secret)
+            if returned_state
+            else None
+        )
+        if not code_verifier:
+            st.error("The authorization session could not be verified. Start YouTube sign-in again.")
+            st.query_params.clear()
+            return
+        try:
+            flow = Flow.from_client_config(
+                {"web": client},
+                scopes=SCOPES,
+                state=returned_state,
+                autogenerate_code_verifier=False,
+            )
+            flow.redirect_uri = redirect_uri
+            flow.code_verifier = code_verifier
+            flow.fetch_token(code=code)
+            token_values = json.loads(flow.credentials.to_json())
+        except Exception as error:
+            st.query_params.clear()
+            st.error(f"Google returned authorization, but the new token could not be created: {error}")
+            return
+
+        st.query_params.clear()
+        token_toml = toml_table("youtube_oauth_token", token_values)
+        st.success("YouTube authorization succeeded. Complete the steps below.")
+        st.code(token_toml, language="toml")
+        st.download_button(
+            "Download replacement token block",
+            data=token_toml,
+            file_name="youtube-token-for-streamlit.toml",
+            mime="text/plain",
+        )
+        st.markdown(
+            "1. Open this app in Streamlit Cloud and choose **Manage app**.\n"
+            "2. Open **Settings**, then **Secrets**.\n"
+            "3. Replace the entire existing `[youtube_oauth_token]` section with the block above.\n"
+            "4. Save, wait for the app to restart, and return to the dashboard."
+        )
+        return
+
+    if st.button("Start YouTube sign-in", type="primary", use_container_width=True):
+        flow = Flow.from_client_config(
+            {"web": client},
+            scopes=SCOPES,
+            autogenerate_code_verifier=False,
+        )
+        flow.redirect_uri = redirect_uri
+        code_verifier = secrets.token_urlsafe(64)
+        flow.code_verifier = code_verifier
+        state = youtube_oauth_state(str(client.get("client_secret", "")), code_verifier)
+        authorization_url, _ = flow.authorization_url(
+            state=state,
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
+        st.link_button(
+            "Continue to Google",
+            authorization_url,
+            type="primary",
+            use_container_width=True,
+        )
+        st.caption("Sign in with the Google account that owns or manages the YouTube channel.")
 
 
 def authed_get_json(credentials: Credentials, url: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -62,8 +261,33 @@ def authed_get_json(credentials: Credentials, url: str, params: dict[str, Any]) 
         headers={"Authorization": f"Bearer {credentials.token}"},
         method="GET",
     )
-    with urlopen(request, timeout=60) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(request, timeout=60) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        raise RuntimeError(youtube_api_error_message(error)) from error
+    except URLError as error:
+        raise RuntimeError(f"YouTube connection error: {error.reason}") from error
+
+
+def youtube_api_error_message(error: HTTPError) -> str:
+    try:
+        body = error.read().decode("utf-8")
+    except Exception:
+        body = ""
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        payload = {}
+
+    api_error = payload.get("error", {})
+    message = api_error.get("message") or body or error.reason
+    if message == "Forbidden":
+        message = (
+            "Forbidden. Confirm the Google account has access to the YouTube channel "
+            "and that YouTube Analytics API and YouTube Data API v3 are enabled."
+        )
+    return f"YouTube API error {error.code}: {message}"
 
 
 def iso_duration_seconds(value: str | None) -> int:
@@ -313,8 +537,8 @@ def complete_daily_frame(daily_df: pd.DataFrame, start_date: date, end_date: dat
 @st.cache_data(ttl=900, show_spinner=False)
 def load_dashboard_data(start_date: date, end_date: date) -> tuple[pd.DataFrame, pd.DataFrame]:
     credentials = make_credentials()
-    secrets = youtube_secrets()
-    podcast_playlist_id = secrets["podcast_playlist_id"]
+    settings = youtube_settings()
+    podcast_playlist_id = settings["podcast_playlist_id"]
 
     totals_df = video_total_rows(credentials, start_date, end_date)
     if totals_df.empty:
@@ -438,6 +662,20 @@ def line_chart(daily_df: pd.DataFrame) -> alt.Chart:
 
 def main() -> None:
     st.set_page_config(page_title="YouTube Content Dashboard", page_icon="YT", layout="wide")
+
+    if "code" in st.query_params or "error" in st.query_params:
+        render_youtube_reconnect_page()
+        return
+
+    page = st.sidebar.radio(
+        "Go to",
+        ["Dashboard", "Reconnect YouTube"],
+        help="Use Reconnect YouTube only when the dashboard reports an authorization problem.",
+    )
+    if page == "Reconnect YouTube":
+        render_youtube_reconnect_page()
+        return
+
     st.markdown(
         """
         <style>
